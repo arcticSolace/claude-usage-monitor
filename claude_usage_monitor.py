@@ -79,14 +79,14 @@ BANNER = f"""{C.BBLUE}{C.BOLD}
 def term_width():
     return shutil.get_terminal_size((100, 40)).columns
 
-def separator(char="", color=C.DIM):
+def separator(char="─", color=C.DIM):
     w = term_width()
     print(f"{color}{char * w}{C.RESET}")
 
 def section_header(title, color=C.BCYAN):
     w = term_width()
     pad = max(0, w - visible_len(title) - 4)
-    print(f"\n{color}{C.BOLD}   {title}{C.RESET}{C.DIM}{' ' + '' * (pad - 1)}{C.RESET}")
+    print(f"\n{color}{C.BOLD}   {title}{C.RESET}{C.DIM}{' ' + '─' * (pad - 1)}{C.RESET}")
 
 def progress_bar(pct, width=40, color_warn=75, color_crit=90):
     filled = int(width * pct / 100)
@@ -98,7 +98,7 @@ def progress_bar(pct, width=40, color_warn=75, color_crit=90):
     else:
         bar_color = C.BGREEN
 
-    bar = f"{bar_color}{'' * filled}{C.DIM}{'' * empty}{C.RESET}"
+    bar = f"{bar_color}{'█' * filled}{C.DIM}{'░' * empty}{C.RESET}"
     return bar
 
 def fmt_tokens(n):
@@ -113,13 +113,13 @@ def fmt_tokens(n):
 def status_icon(status):
     status = (status or "").lower()
     if status == "operational":
-        return f"{C.BGREEN}{C.RESET}", f"{C.BGREEN}Operational{C.RESET}"
+        return f"{C.BGREEN}●{C.RESET}", f"{C.BGREEN}Operational{C.RESET}"
     if status in ("degraded_performance", "partial_outage"):
-        return f"{C.BYELLOW}{C.RESET}", f"{C.BYELLOW}{status.replace('_',' ').title()}{C.RESET}"
+        return f"{C.BYELLOW}●{C.RESET}", f"{C.BYELLOW}{status.replace('_',' ').title()}{C.RESET}"
     if status == "major_outage":
-        return f"{C.BRED}{C.RESET}", f"{C.BRED}Major Outage{C.RESET}"
+        return f"{C.BRED}●{C.RESET}", f"{C.BRED}Major Outage{C.RESET}"
     if status == "under_maintenance":
-        return f"{C.BCYAN}{C.RESET}", f"{C.BCYAN}Maintenance{C.RESET}"
+        return f"{C.BCYAN}●{C.RESET}", f"{C.BCYAN}Maintenance{C.RESET}"
     return f"{C.DIM}?{C.RESET}", f"{C.DIM}{status or 'Unknown'}{C.RESET}"
 
 #  JSONL parsing 
@@ -361,7 +361,7 @@ def impact_color(impact):
 def print_banner():
     os.system("cls" if os.name == "nt" else "clear")
     print(BANNER)
-    separator("", C.BBLUE)
+    separator("─", C.BBLUE)
 
 def print_session(sess, plan_limits):
     section_header("CURRENT SESSION  (5-hour rolling window)")
@@ -415,7 +415,7 @@ def print_session(sess, plan_limits):
         print(f"\n  {C.DIM}Session limit: not applicable for API/pay-per-use plans{C.RESET}")
 
 def print_weekly(weekly, plan_limits):
-    section_header("WEEKLY LIMIT  (Mon  Sun calendar week)")
+    section_header("WEEKLY LIMIT  (Mon – Sun calendar week)")
 
     total = weekly["total"]
     limit = plan_limits["weekly"]
@@ -450,11 +450,11 @@ def print_service_status(components, overall_status):
     ov_ind = overall_status.get("indicator", "none")
     ov_desc= overall_status.get("description", "")
     if ov_ind == "none":
-        ov_str = f"{C.BGREEN}{C.BOLD}  {ov_desc}{C.RESET}"
+        ov_str = f"{C.BGREEN}{C.BOLD}●  {ov_desc}{C.RESET}"
     elif ov_ind == "minor":
-        ov_str = f"{C.BYELLOW}{C.BOLD}  {ov_desc}{C.RESET}"
+        ov_str = f"{C.BYELLOW}{C.BOLD}●  {ov_desc}{C.RESET}"
     else:
-        ov_str = f"{C.BRED}{C.BOLD}  {ov_desc}{C.RESET}"
+        ov_str = f"{C.BRED}{C.BOLD}●  {ov_desc}{C.RESET}"
     print(f"  Overall:    {ov_str}\n")
 
     # Per-component rows
@@ -470,14 +470,14 @@ def print_incidents(unresolved, resolved):
     section_header("INCIDENT ALERTS")
 
     if not unresolved and not resolved:
-        print(f"\n  {C.BGREEN}  No incidents to report.{C.RESET}\n")
+        print(f"\n  {C.BGREEN}●  No incidents to report.{C.RESET}\n")
         return
 
     if unresolved:
-        print(f"\n  {C.BRED}{C.BOLD}  ACTIVE INCIDENTS ({len(unresolved)}){C.RESET}")
+        print(f"\n  {C.BRED}{C.BOLD}●  ACTIVE INCIDENTS ({len(unresolved)}){C.RESET}")
         for inc in unresolved:
             ic = impact_color(inc["impact"])
-            print(f"\n  {ic} {inc['name']}{C.RESET}")
+            print(f"\n  {ic}●  {inc['name']}{C.RESET}")
             print(f"    {C.DIM}Status:{C.RESET}  {inc['status'].upper()}"
                   f"   {C.DIM}Impact:{C.RESET}  {inc['impact'].upper()}")
             print(f"    {C.DIM}Started:{C.RESET} {fmt_ts(inc['started'])}"
@@ -488,13 +488,13 @@ def print_incidents(unresolved, resolved):
     if resolved:
         print(f"\n  {C.DIM}RECENTLY RESOLVED ({len(resolved)}){C.RESET}")
         for inc in resolved[:3]:
-            print(f"\n  {C.DIM} {inc['name']}{C.RESET}")
+            print(f"\n  {C.DIM}○  {inc['name']}{C.RESET}")
             print(f"    {C.DIM}Resolved at: {fmt_ts(inc['updated'])}{C.RESET}")
             if inc["latest"]:
                 print(f"    {C.DIM}{inc['latest']}{C.RESET}")
 
 def print_footer(plan_label, refreshed_at, auto_refresh=None):
-    separator("", C.DIM)
+    separator("─", C.DIM)
     ts = refreshed_at.strftime("%Y-%m-%d %H:%M:%S UTC")
     ar = f"  {C.DIM}Auto-refresh: {auto_refresh}s{C.RESET}" if auto_refresh else ""
     print(f"  {C.DIM}Plan:{C.RESET} {C.BCYAN}{plan_label}{C.RESET}"
