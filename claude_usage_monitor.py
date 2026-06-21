@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 
-        Claude Code - Usage & Status Monitor                       
-        Reads local JSONL logs + Anthropic Status API              
+        Claude Code - Usage & Status Monitor
+        Reads local JSONL logs + Anthropic Status API
 
 """
 
 import os
+import re
+import sys
 import json
 import glob
 import time
@@ -17,7 +19,9 @@ import argparse
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-#  ANSI colours 
+__version__ = "1.0.0"
+
+#  ANSI colours
 class C:
     RESET   = "\033[0m"
     BOLD    = "\033[1m"
@@ -48,23 +52,21 @@ class C:
     BG_CYAN  = "\033[46m"
 
 def no_color(s):
-    """Strip ANSI codes for width calculations."""
-    import re
     return re.sub(r'\033\[[0-9;]*m', '', s)
 
 def visible_len(s):
     return len(no_color(s))
 
-#  Token limits per plan 
+#  Token limits per plan
 PLAN_LIMITS = {
-    "pro":   {"session": 44_000,  "weekly": 308_000,  "label": "Pro"},
-    "max5":  {"session": 88_000,  "weekly": 616_000,  "label": "Max 5"},
-    "max20": {"session": 220_000, "weekly": 1_540_000, "label": "Max 20"},
-    "api":   {"session": None,    "weekly": None,      "label": "API (pay-per-use)"},
+    "pro":   {"session": 44_000,   "weekly": 308_000,   "label": "Pro"},
+    "max5":  {"session": 88_000,   "weekly": 616_000,   "label": "Max 5"},
+    "max20": {"session": 220_000,  "weekly": 1_540_000, "label": "Max 20"},
+    "api":   {"session": None,     "weekly": None,      "label": "API (pay-per-use)"},
 }
 SESSION_WINDOW_HOURS = 5
 
-#  ASCII Banner 
+#  ASCII Banner
 BANNER = f"""{C.BBLUE}{C.BOLD}
   ██████╗██╗      █████╗ ██╗  ██╗ ██████╗ ███████╗
  ██╔════╝██║     ██╔══██╗██║  ██║ ██╔══██╗██╔════╝
@@ -75,7 +77,7 @@ BANNER = f"""{C.BBLUE}{C.BOLD}
 {C.CYAN}{C.BOLD}             C O D E      U S A G E   &   S T A T U S{C.RESET}
 {C.DIM}         Reads ~/.claude JSONL logs + status.anthropic.com{C.RESET}"""
 
-#  Helpers 
+#  Helpers
 def term_width():
     return shutil.get_terminal_size((100, 40)).columns
 
@@ -97,9 +99,7 @@ def progress_bar(pct, width=40, color_warn=75, color_crit=90):
         bar_color = C.BYELLOW
     else:
         bar_color = C.BGREEN
-
-    bar = f"{bar_color}{'█' * filled}{C.DIM}{'░' * empty}{C.RESET}"
-    return bar
+    return f"{bar_color}{'█' * filled}{C.DIM}{'░' * empty}{C.RESET}"
 
 def fmt_tokens(n):
     if n is None:
@@ -115,174 +115,116 @@ def status_icon(status):
     if status == "operational":
         return f"{C.BGREEN}●{C.RESET}", f"{C.BGREEN}Operational{C.RESET}"
     if status in ("degraded_performance", "partial_outage"):
-        return f"{C.BYELLOW}●{C.RESET}", f"{C.BYELLOW}{status.replace('_',' ').title()}{C.RESET}"
+        return f"{C.BYELLOW}●{C.RESET}", f"{C.BYELLOW}{status.replace('_', ' ').title()}{C.RESET}"
     if status == "major_outage":
         return f"{C.BRED}●{C.RESET}", f"{C.BRED}Major Outage{C.RESET}"
     if status == "under_maintenance":
         return f"{C.BCYAN}●{C.RESET}", f"{C.BCYAN}Maintenance{C.RESET}"
     return f"{C.DIM}?{C.RESET}", f"{C.DIM}{status or 'Unknown'}{C.RESET}"
 
-#  JSONL parsing 
+#  JSONL parsing
 def find_jsonl_files():
-    """Return list of all session JSONL file paths."""
-    paths = []
+    """Return (list_of_jsonl_paths, statusline_path)."""
     base = Path.home() / ".claude" / "projects"
-    if base.exists():
-        # top-level JSONL only (skip subagent sub-dirs)
-        paths += glob.glob(str(base / "*" / "*.jsonl"))
-    # Statusline snapshots
+    paths = glob.glob(str(base / "*" / "*.jsonl")) if base.exists() else []
     sl = Path.home() / ".claude" / "statusline.jsonl"
     return paths, sl
 
+def iter_usage_records(jsonl_files, since=None):
+    """Yield (record, timestamp) for each valid usage record at or after `since`."""
+    for path in jsonl_files:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts_str = rec.get("timestamp")
+                    if not ts_str:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if since is not None and ts < since:
+                        continue
+                    yield rec, ts
+        except (OSError, PermissionError):
+            continue
+
 def parse_session_tokens(jsonl_files, window_hours=SESSION_WINDOW_HOURS):
-    """
-    Parse tokens from current 5-hour session window.
-    Returns (input_tok, output_tok, cache_read, cache_write, model, session_start_ts).
-    """
+    """Parse tokens from the current rolling session window."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     total_input = total_output = cache_read = cache_write = 0
     model_used  = "unknown"
     session_start = None
-    files_found = len(jsonl_files)
 
-    for path in jsonl_files:
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    ts_str = rec.get("timestamp")
-                    if not ts_str:
-                        continue
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-
-                    if ts < cutoff:
-                        continue
-
-                    # Track session start
-                    if session_start is None or ts < session_start:
-                        session_start = ts
-
-                    # Get usage from assistant messages
-                    usage = None
-                    msg = rec.get("message", {})
-                    if isinstance(msg, dict):
-                        usage = msg.get("usage")
-                        m = msg.get("model")
-                        if m and m != "unknown":
-                            model_used = m
-                    if usage is None:
-                        usage = rec.get("usage")
-
-                    if isinstance(usage, dict):
-                        total_input  += usage.get("input_tokens", 0)
-                        total_output += usage.get("output_tokens", 0)
-                        cache_read   += usage.get("cache_read_input_tokens", 0)
-                        cache_write  += usage.get("cache_creation_input_tokens", 0)
-        except (OSError, PermissionError):
-            continue
+    for rec, ts in iter_usage_records(jsonl_files, since=cutoff):
+        if session_start is None or ts < session_start:
+            session_start = ts
+        msg = rec.get("message", {})
+        usage = None
+        if isinstance(msg, dict):
+            usage = msg.get("usage")
+            m = msg.get("model")
+            if m and m != "unknown":
+                model_used = m
+        if usage is None:
+            usage = rec.get("usage")
+        if isinstance(usage, dict):
+            total_input  += usage.get("input_tokens", 0)
+            total_output += usage.get("output_tokens", 0)
+            cache_read   += usage.get("cache_read_input_tokens", 0)
+            cache_write  += usage.get("cache_creation_input_tokens", 0)
 
     return {
-        "input":        total_input,
-        "output":       total_output,
-        "cache_read":   cache_read,
-        "cache_write":  cache_write,
-        "total":        total_input + total_output,
-        "model":        model_used,
-        "session_start":session_start,
-        "files_scanned":files_found,
+        "input":         total_input,
+        "output":        total_output,
+        "cache_read":    cache_read,
+        "cache_write":   cache_write,
+        "total":         total_input + total_output,
+        "model":         model_used,
+        "session_start": session_start,
+        "files_scanned": len(jsonl_files),
     }
 
 def parse_weekly_tokens(jsonl_files):
-    """Sum tokens for the current calendar week (MonSun)."""
-    now  = datetime.now(timezone.utc)
-    week_start = now - timedelta(days=now.weekday())  # Monday 00:00
-    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
-
+    """Sum tokens for the current calendar week (Mon–Sun)."""
+    now = datetime.now(timezone.utc)
+    week_start = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     total_input = total_output = 0
-    for path in jsonl_files:
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    ts_str = rec.get("timestamp")
-                    if not ts_str:
-                        continue
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    if ts < week_start:
-                        continue
-
-                    usage = None
-                    msg = rec.get("message", {})
-                    if isinstance(msg, dict):
-                        usage = msg.get("usage")
-                    if usage is None:
-                        usage = rec.get("usage")
-                    if isinstance(usage, dict):
-                        total_input  += usage.get("input_tokens", 0)
-                        total_output += usage.get("output_tokens", 0)
-        except (OSError, PermissionError):
-            continue
-
+    for rec, _ in iter_usage_records(jsonl_files, since=week_start):
+        msg = rec.get("message", {})
+        usage = None
+        if isinstance(msg, dict):
+            usage = msg.get("usage")
+        if usage is None:
+            usage = rec.get("usage")
+        if isinstance(usage, dict):
+            total_input  += usage.get("input_tokens", 0)
+            total_output += usage.get("output_tokens", 0)
     return {
-        "input":  total_input,
-        "output": total_output,
-        "total":  total_input + total_output,
+        "input":      total_input,
+        "output":     total_output,
+        "total":      total_input + total_output,
         "week_start": week_start,
     }
 
-def read_statusline(sl_path):
-    """Read the latest entry from ~/.claude/statusline.jsonl."""
-    if not sl_path.exists():
-        return None
-    last = None
-    try:
-        with open(sl_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        last = json.loads(line)
-                    except json.JSONDecodeError:
-                        pass
-    except (OSError, PermissionError):
-        pass
-    return last
-
-#  Anthropic Status API 
+#  Anthropic Status API
 STATUS_URL = "https://status.anthropic.com/api/v2/summary.json"
-
-COMPONENT_NAMES = {
-    "claude api": "Claude API",
-    "api":        "Claude API",
-    "claude code":"Claude Code",
-    "claude.ai":  "claude.ai",
-}
 
 def fetch_status(timeout=8):
     """Fetch status summary from Anthropic's statuspage API."""
     try:
         req = urllib.request.Request(
             STATUS_URL,
-            headers={"User-Agent": "claude-usage-monitor/1.0"},
+            headers={"User-Agent": f"claude-usage-monitor/{__version__}"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
@@ -290,7 +232,7 @@ def fetch_status(timeout=8):
         return None
 
 def extract_components(data):
-    """Return dict: component_name  status for key services."""
+    """Return dict of component_name → status for key services."""
     if not data:
         return {}
     result = {}
@@ -309,42 +251,29 @@ def extract_components(data):
     return result
 
 def extract_incidents(data, limit=5):
-    """Return recent unresolved + resolved incidents."""
+    """Return (unresolved, resolved) incident lists, capped at limit / 3."""
     if not data:
         return [], []
-
     unresolved = []
     resolved   = []
-
     for inc in data.get("incidents", []):
-        name    = inc.get("name", "Unknown incident")
-        status  = inc.get("status", "")
-        impact  = inc.get("impact", "none")
-        started = inc.get("created_at", "")
-        updated = inc.get("updated_at", "")
-
-        # Latest update text
-        updates = inc.get("incident_updates", [])
+        updates     = inc.get("incident_updates", [])
         latest_body = updates[0].get("body", "") if updates else ""
-
         entry = {
-            "name":    name,
-            "status":  status,
-            "impact":  impact,
-            "started": started,
-            "updated": updated,
+            "name":    inc.get("name", "Unknown incident"),
+            "status":  inc.get("status", ""),
+            "impact":  inc.get("impact", "none"),
+            "started": inc.get("created_at", ""),
+            "updated": inc.get("updated_at", ""),
             "latest":  latest_body[:120] + ("…" if len(latest_body) > 120 else ""),
         }
-
-        if status in ("resolved", "postmortem"):
+        if entry["status"] in ("resolved", "postmortem"):
             resolved.append(entry)
         else:
             unresolved.append(entry)
-
-    return unresolved[:limit], resolved[:limit]
+    return unresolved[:limit], resolved[:3]
 
 def fmt_ts(ts_str):
-    """Format ISO timestamp to human-readable local-ish string."""
     if not ts_str:
         return "N/A"
     try:
@@ -357,53 +286,52 @@ def impact_color(impact):
     m = {"critical": C.BRED, "major": C.BRED, "minor": C.BYELLOW, "none": C.DIM}
     return m.get((impact or "").lower(), C.DIM)
 
-#  Display functions 
-def print_banner():
-    os.system("cls" if os.name == "nt" else "clear")
+#  Display functions
+def print_banner(clear=False):
+    if clear and sys.stdout.isatty():
+        os.system("cls" if os.name == "nt" else "clear")
     print(BANNER)
     separator("─", C.BBLUE)
 
 def print_session(sess, plan_limits):
     section_header("CURRENT SESSION  (5-hour rolling window)")
 
-    total    = sess["total"]
-    limit    = plan_limits["session"]
-    start    = sess["session_start"]
-    model    = sess["model"]
-    scanned  = sess["files_scanned"]
+    total   = sess["total"]
+    limit   = plan_limits["session"]
+    start   = sess["session_start"]
+    model   = sess["model"]
+    scanned = sess["files_scanned"]
 
     now = datetime.now(timezone.utc)
     if start:
-        elapsed   = now - start
-        el_h, rem = divmod(int(elapsed.total_seconds()), 3600)
-        el_m      = rem // 60
-        remaining_s = max(0, SESSION_WINDOW_HOURS * 3600 - int(elapsed.total_seconds()))
+        elapsed_s   = int((now - start).total_seconds())
+        el_h, rem   = divmod(elapsed_s, 3600)
+        el_m        = rem // 60
+        remaining_s = max(0, SESSION_WINDOW_HOURS * 3600 - elapsed_s)
         rem_h, rem2 = divmod(remaining_s, 3600)
-        rem_m        = rem2 // 60
-        elapsed_str  = f"{el_h}h {el_m:02d}m"
-        remaining_str= f"{rem_h}h {rem_m:02d}m"
+        rem_m       = rem2 // 60
+        elapsed_str   = f"{el_h}h {el_m:02d}m"
+        remaining_str = f"{rem_h}h {rem_m:02d}m"
     else:
         elapsed_str = remaining_str = "N/A"
 
-    # Token breakdown
     print(f"\n  {C.DIM}Model:{C.RESET}    {C.BCYAN}{model}{C.RESET}   "
           f"{C.DIM}Files scanned:{C.RESET} {scanned}")
     print(f"  {C.DIM}Started:{C.RESET}  {start.strftime('%H:%M:%S UTC') if start else 'No active session'}"
           f"   {C.DIM}Elapsed:{C.RESET} {elapsed_str}   {C.DIM}Remaining:{C.RESET} {remaining_str}\n")
 
     rows = [
-        ("Input tokens",        sess["input"]),
-        ("Output tokens",       sess["output"]),
-        ("Cache reads",         sess["cache_read"]),
-        ("Cache writes",        sess["cache_write"]),
-        ("Total tokens used",   total),
+        ("Input tokens",      sess["input"]),
+        ("Output tokens",     sess["output"]),
+        ("Cache reads",       sess["cache_read"]),
+        ("Cache writes",      sess["cache_write"]),
+        ("Total tokens used", total),
     ]
     for label, val in rows:
-        bold = C.BOLD if label.startswith("Total") else ""
+        bold  = C.BOLD if label.startswith("Total") else ""
         color = C.BWHITE if label.startswith("Total") else C.WHITE
         print(f"  {bold}{color}{label:<22}{C.RESET}  {C.BYELLOW}{fmt_tokens(val):>8}{C.RESET}")
 
-    # Progress bar
     if limit:
         pct = min(100.0, total / limit * 100)
         bar = progress_bar(pct)
@@ -423,8 +351,8 @@ def print_weekly(weekly, plan_limits):
 
     print(f"\n  {C.DIM}Week from:{C.RESET}  {ws.strftime('%Y-%m-%d (Monday) UTC')}\n")
     rows = [
-        ("Input tokens",  weekly["input"]),
-        ("Output tokens", weekly["output"]),
+        ("Input tokens",    weekly["input"]),
+        ("Output tokens",   weekly["output"]),
         ("Total this week", total),
     ]
     for label, val in rows:
@@ -446,9 +374,8 @@ def print_service_status(components, overall_status):
     section_header("SERVICE STATUS")
     print()
 
-    # Overall page indicator
-    ov_ind = overall_status.get("indicator", "none")
-    ov_desc= overall_status.get("description", "")
+    ov_ind  = overall_status.get("indicator", "none")
+    ov_desc = overall_status.get("description", "")
     if ov_ind == "none":
         ov_str = f"{C.BGREEN}{C.BOLD}●  {ov_desc}{C.RESET}"
     elif ov_ind == "minor":
@@ -457,9 +384,7 @@ def print_service_status(components, overall_status):
         ov_str = f"{C.BRED}{C.BOLD}●  {ov_desc}{C.RESET}"
     print(f"  Overall:    {ov_str}\n")
 
-    # Per-component rows
-    target_keys = ["Claude API", "Claude Code", "claude.ai", "Console"]
-    for key in target_keys:
+    for key in ["Claude API", "Claude Code", "claude.ai", "Console"]:
         status = components.get(key)
         if status is None:
             continue
@@ -487,7 +412,7 @@ def print_incidents(unresolved, resolved):
 
     if resolved:
         print(f"\n  {C.DIM}RECENTLY RESOLVED ({len(resolved)}){C.RESET}")
-        for inc in resolved[:3]:
+        for inc in resolved:
             print(f"\n  {C.DIM}○  {inc['name']}{C.RESET}")
             print(f"    {C.DIM}Resolved at: {fmt_ts(inc['updated'])}{C.RESET}")
             if inc["latest"]:
@@ -503,26 +428,35 @@ def print_footer(plan_label, refreshed_at, auto_refresh=None):
     if auto_refresh:
         print(f"  {C.DIM}Press Ctrl+C to exit{C.RESET}")
 
-#  Main render 
+#  Main render
 def render(plan, auto_refresh=None):
     plan_limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["pro"])
 
-    # Gather data
     jsonl_files, sl_path = find_jsonl_files()
     sess   = parse_session_tokens(jsonl_files)
     weekly = parse_weekly_tokens(jsonl_files)
-    sl     = read_statusline(sl_path)
 
-    # Enrich session model from statusline if available
-    if sl and sess["model"] == "unknown":
-        sess["model"] = sl.get("model", "unknown")
+    # Fill model from statusline when the JSONL records don't include it
+    if sess["model"] == "unknown" and sl_path.exists():
+        try:
+            last = None
+            with open(sl_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            last = json.loads(line)
+                        except json.JSONDecodeError:
+                            pass
+            if last:
+                sess["model"] = last.get("model", "unknown")
+        except (OSError, PermissionError):
+            pass
 
-    # Status API
-    status_data = fetch_status()
-    components  = {}
-    overall     = {"indicator": "none", "description": "All Systems Operational"}
-    unresolved  = []
-    resolved_inc= []
+    status_data  = fetch_status()
+    components   = {}
+    overall      = {"indicator": "none", "description": "All Systems Operational"}
+    unresolved   = []
+    resolved_inc = []
 
     if status_data:
         components  = extract_components(status_data)
@@ -538,8 +472,7 @@ def render(plan, auto_refresh=None):
 
     now = datetime.now(timezone.utc)
 
-    # Render
-    print_banner()
+    print_banner(clear=auto_refresh is not None)
     print_session(sess, plan_limits)
     print_weekly(weekly, plan_limits)
     print_service_status(components, overall)
@@ -548,23 +481,32 @@ def render(plan, auto_refresh=None):
     print_footer(plan_limits["label"], now, auto_refresh)
     print()
 
-#  Entry point 
+#  Entry point
 def main():
     parser = argparse.ArgumentParser(
         description="Claude Code Usage & Status Monitor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Plans:
-  pro     Claude Pro        (~44K tokens / 5-hour window)
-  max5    Claude Max 5     (~88K tokens / 5-hour window)
-  max20   Claude Max 20    (~220K tokens / 5-hour window)
+  pro     Claude Pro         (~44K tokens / 5-hour window)
+  max5    Claude Max 5×      (~88K tokens / 5-hour window)
+  max20   Claude Max 20×     (~220K tokens / 5-hour window)
   api     API / pay-per-use  (no hard token limits shown)
+
+Notes:
+  Token counts exclude subagent sessions (subdirectories under
+  ~/.claude/projects/ are not scanned by design).
+  The 5-hour window is a rolling lookback, not anchored to your
+  actual session start time.
 
 Examples:
   python claude_usage_monitor.py
   python claude_usage_monitor.py --plan max5
   python claude_usage_monitor.py --watch 30
   python claude_usage_monitor.py --plan max20 --watch 60
+  python claude_usage_monitor.py --no-color | grep Total
+
+Version: {__version__}
         """,
     )
     parser.add_argument(
@@ -573,11 +515,26 @@ Examples:
     )
     parser.add_argument(
         "--watch", type=int, metavar="SECONDS",
-        help="Auto-refresh interval in seconds (e.g. --watch 30)"
+        help="Auto-refresh interval in seconds, minimum 5 (e.g. --watch 30)"
+    )
+    parser.add_argument(
+        "--no-color", action="store_true",
+        help="Strip ANSI colour codes (auto-detected when output is not a TTY)"
     )
     args = parser.parse_args()
 
-    if args.watch:
+    if args.no_color or not sys.stdout.isatty():
+        import builtins
+        _real_print = builtins.print
+        builtins.print = lambda *a, **k: _real_print(
+            *(re.sub(r'\033\[[0-9;]*m', '', str(x)) for x in a), **k
+        )
+        global BANNER
+        BANNER = re.sub(r'\033\[[0-9;]*m', '', BANNER)
+
+    if args.watch is not None:
+        if args.watch < 5:
+            parser.error("--watch interval must be at least 5 seconds")
         try:
             while True:
                 render(args.plan, auto_refresh=args.watch)

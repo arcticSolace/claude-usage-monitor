@@ -28,8 +28,11 @@ python claude_usage_monitor.py
 # Specify your plan
 python claude_usage_monitor.py --plan max5
 
-# Auto-refresh every 30 seconds
+# Auto-refresh every 30 seconds (minimum interval: 5s)
 python claude_usage_monitor.py --plan max20 --watch 30
+
+# Plain text output — safe to pipe or redirect
+python claude_usage_monitor.py --no-color | grep Total
 ```
 
 ## Plan limits
@@ -50,3 +53,9 @@ python claude_usage_monitor.py --plan max20 --watch 30
 | Active model    | JSONL logs → `~/.claude/statusline.jsonl`   |
 
 No data leaves your machine except the read-only status API call.
+
+## Caveats
+
+- **Subagent tokens are not counted.** Only top-level JSONL files are scanned; subdirectories (subagent sessions) are excluded by design. Usage from heavy agent workloads will be under-reported.
+- **The 5-hour window is a rolling lookback**, not anchored to your actual session start. The "remaining" time shown is approximate.
+- **Plan token limits are hardcoded** and may drift if Anthropic changes them.
