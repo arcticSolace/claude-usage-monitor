@@ -58,11 +58,15 @@ def visible_len(s):
     return len(no_color(s))
 
 #  Token limits per plan
+#  Session limits: Anthropic rate-limits Claude Code in a 5-hour rolling window.
+#  Monthly limits: estimated token equivalents; Anthropic publishes these as
+#  "5× / 20× more usage than Pro" without stating exact token values.
+#  Max 5× = 5× Pro, Max 20× = 20× Pro — limits reset on the monthly billing cycle.
 PLAN_LIMITS = {
-    "pro":   {"session": 44_000,   "weekly": 308_000,   "label": "Pro"},
-    "max5":  {"session": 88_000,   "weekly": 616_000,   "label": "Max 5"},
-    "max20": {"session": 220_000,  "weekly": 1_540_000, "label": "Max 20"},
-    "api":   {"session": None,     "weekly": None,      "label": "API (pay-per-use)"},
+    "pro":   {"session": 44_000,    "monthly": 1_000_000,   "label": "Pro"},
+    "max5":  {"session": 220_000,   "monthly": 5_000_000,   "label": "Max 5×"},
+    "max20": {"session": 880_000,   "monthly": 20_000_000,  "label": "Max 20×"},
+    "api":   {"session": None,      "monthly": None,         "label": "API (pay-per-use)"},
 }
 SESSION_WINDOW_HOURS = 5
 
@@ -192,14 +196,12 @@ def parse_session_tokens(jsonl_files, window_hours=SESSION_WINDOW_HOURS):
         "files_scanned": len(jsonl_files),
     }
 
-def parse_weekly_tokens(jsonl_files):
-    """Sum tokens for the current calendar week (Mon–Sun)."""
+def parse_monthly_tokens(jsonl_files):
+    """Sum tokens for the current calendar month (1st → now)."""
     now = datetime.now(timezone.utc)
-    week_start = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     total_input = total_output = 0
-    for rec, _ in iter_usage_records(jsonl_files, since=week_start):
+    for rec, _ in iter_usage_records(jsonl_files, since=month_start):
         msg = rec.get("message", {})
         usage = None
         if isinstance(msg, dict):
@@ -210,10 +212,10 @@ def parse_weekly_tokens(jsonl_files):
             total_input  += usage.get("input_tokens", 0)
             total_output += usage.get("output_tokens", 0)
     return {
-        "input":      total_input,
-        "output":     total_output,
-        "total":      total_input + total_output,
-        "week_start": week_start,
+        "input":       total_input,
+        "output":      total_output,
+        "total":       total_input + total_output,
+        "month_start": month_start,
     }
 
 #  Anthropic Status API
@@ -342,18 +344,18 @@ def print_session(sess, plan_limits):
     else:
         print(f"\n  {C.DIM}Session limit: not applicable for API/pay-per-use plans{C.RESET}")
 
-def print_weekly(weekly, plan_limits):
-    section_header("WEEKLY LIMIT  (Mon – Sun calendar week)")
+def print_monthly(monthly, plan_limits):
+    section_header("MONTHLY USAGE  (billing month, 1st → now)")
 
-    total = weekly["total"]
-    limit = plan_limits["weekly"]
-    ws    = weekly["week_start"]
+    total = monthly["total"]
+    limit = plan_limits["monthly"]
+    ms    = monthly["month_start"]
 
-    print(f"\n  {C.DIM}Week from:{C.RESET}  {ws.strftime('%Y-%m-%d (Monday) UTC')}\n")
+    print(f"\n  {C.DIM}Month from:{C.RESET}  {ms.strftime('%Y-%m-01 UTC')}\n")
     rows = [
-        ("Input tokens",    weekly["input"]),
-        ("Output tokens",   weekly["output"]),
-        ("Total this week", total),
+        ("Input tokens",      monthly["input"]),
+        ("Output tokens",     monthly["output"]),
+        ("Total this month",  total),
     ]
     for label, val in rows:
         bold  = C.BOLD if label.startswith("Total") else ""
@@ -364,11 +366,11 @@ def print_weekly(weekly, plan_limits):
         pct = min(100.0, total / limit * 100)
         bar = progress_bar(pct)
         limit_color = C.BRED if pct >= 90 else (C.BYELLOW if pct >= 75 else C.BGREEN)
-        print(f"\n  {C.DIM}Weekly limit ({fmt_tokens(limit)}):{C.RESET}")
+        print(f"\n  {C.DIM}Monthly limit (~{fmt_tokens(limit)}):{C.RESET}")
         print(f"  {bar}  {limit_color}{C.BOLD}{pct:5.1f}%{C.RESET}  "
-              f"{C.DIM}({fmt_tokens(total)} / {fmt_tokens(limit)}){C.RESET}")
+              f"{C.DIM}({fmt_tokens(total)} / ~{fmt_tokens(limit)}){C.RESET}")
     else:
-        print(f"\n  {C.DIM}Weekly limit: not applicable for API/pay-per-use plans{C.RESET}")
+        print(f"\n  {C.DIM}Monthly limit: not applicable for API/pay-per-use plans{C.RESET}")
 
 def print_service_status(components, overall_status):
     section_header("SERVICE STATUS")
@@ -433,8 +435,8 @@ def render(plan, auto_refresh=None):
     plan_limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["pro"])
 
     jsonl_files, sl_path = find_jsonl_files()
-    sess   = parse_session_tokens(jsonl_files)
-    weekly = parse_weekly_tokens(jsonl_files)
+    sess    = parse_session_tokens(jsonl_files)
+    monthly = parse_monthly_tokens(jsonl_files)
 
     # Fill model from statusline when the JSONL records don't include it
     if sess["model"] == "unknown" and sl_path.exists():
@@ -474,7 +476,7 @@ def render(plan, auto_refresh=None):
 
     print_banner(clear=auto_refresh is not None)
     print_session(sess, plan_limits)
-    print_weekly(weekly, plan_limits)
+    print_monthly(monthly, plan_limits)
     print_service_status(components, overall)
     print_incidents(unresolved, resolved_inc)
     print()
@@ -488,14 +490,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 Plans:
-  pro     Claude Pro         (~44K tokens / 5-hour window)
-  max5    Claude Max 5×      (~88K tokens / 5-hour window)
-  max20   Claude Max 20×     (~220K tokens / 5-hour window)
+  pro     Claude Pro         (~44K tokens / 5-hr session,  ~1M tokens / month)
+  max5    Claude Max 5×      (~220K tokens / 5-hr session, ~5M tokens / month)
+  max20   Claude Max 20×     (~880K tokens / 5-hr session, ~20M tokens / month)
   api     API / pay-per-use  (no hard token limits shown)
 
 Notes:
-  Token counts exclude subagent sessions (subdirectories under
-  ~/.claude/projects/ are not scanned by design).
+  Monthly limits are estimates — Anthropic defines Max 5× and Max 20× as
+  "5× / 20× more usage than Pro" without publishing exact token values.
+  Limits reset on your monthly billing cycle (approximated here as the 1st).
   The 5-hour window is a rolling lookback, not anchored to your
   actual session start time.
 
