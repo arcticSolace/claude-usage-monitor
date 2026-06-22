@@ -9,9 +9,10 @@ Terminal dashboard for Claude Code — tracks token consumption and live service
 
 ## What it does
 
-- Parses `~/.claude/projects/*/` JSONL session logs to compute token usage over two windows:
+- Parses `~/.claude/projects/*/` JSONL session logs to compute token usage over three windows:
   - **5-hour rolling window** — mirrors Claude's rate-limit cycle
   - **Current calendar week** (Mon–Sun)
+  - **Current billing month** (1st of month → now)
 - Fetches `status.anthropic.com` for live service health and active incidents
 - Renders a colour-coded terminal dashboard with progress bars that warn at 75% and go critical at 90%
 
@@ -37,12 +38,14 @@ python claude_usage_monitor.py --no-color | grep Total
 
 ## Plan limits
 
-| Flag    | Plan             | Session limit | Weekly limit |
-|---------|------------------|--------------|--------------|
-| `pro`   | Claude Pro       | 44K tokens   | 308K tokens  |
-| `max5`  | Claude Max 5×    | 88K tokens   | 616K tokens  |
-| `max20` | Claude Max 20×   | 220K tokens  | 1.54M tokens |
-| `api`   | API / pay-per-use | —           | —            |
+All values are estimates. Anthropic defines Max 5× and Max 20× as "5× / 20× more usage than Pro" without publishing exact token counts. Monthly limits reset on your billing cycle (approximated here as the 1st of the month).
+
+| Flag    | Plan              | Session (5 hr) | Weekly    | Monthly  |
+|---------|-------------------|----------------|-----------|----------|
+| `pro`   | Claude Pro        | ~500K tokens   | ~2.4M     | ~10M     |
+| `max5`  | Claude Max 5×     | ~2.5M tokens   | ~12M      | ~50M     |
+| `max20` | Claude Max 20×    | ~10M tokens    | ~48M      | ~200M    |
+| `api`   | API / pay-per-use | —              | —         | —        |
 
 ## Data sources
 
@@ -56,6 +59,6 @@ No data leaves your machine except the read-only status API call.
 
 ## Caveats
 
-- **Subagent tokens are not counted.** Only top-level JSONL files are scanned; subdirectories (subagent sessions) are excluded by design. Usage from heavy agent workloads will be under-reported.
+- **Token counts are input + output only.** Cache reads and cache writes are shown separately but excluded from the totals used in progress bars.
 - **The 5-hour window is a rolling lookback**, not anchored to your actual session start. The "remaining" time shown is approximate.
-- **Plan token limits are hardcoded** and may drift if Anthropic changes them.
+- **Plan token limits are hardcoded estimates** and may drift if Anthropic changes them.
